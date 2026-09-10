@@ -1,3 +1,8 @@
+/* Legacy STM32 integration, retained with its original MIT attribution.
+ * New projects should use include/ly_power/power_control.h and src/power_control.c.
+ * This file still requires the original board project and is not built by CMake.
+ */
+#include <math.h>
 #include "chassis_power_control.h"
 #include "referee.h"
 #include "arm_math.h"
@@ -31,6 +36,8 @@ void chassis_power_control(chassis_move_t *chassis_power_control)
 	PID_calc(&chassis_power_control->buffer_pid, chassis_power_buffer, 30);
 	get_chassis_max_power(&max_power_limit);
 	input_power = max_power_limit - chassis_power_control->buffer_pid.out; // Input power floating at maximum power
+	if (!isfinite(input_power) || input_power < 0.0f)
+		input_power = 0.0f;
 
 	CAN_CMD_CAP(input_power); // set the input power of capacitor controller
 
@@ -65,7 +72,7 @@ void chassis_power_control(chassis_move_t *chassis_power_control)
 								k1 * chassis_power_control->motor_chassis[i].chassis_motor_measure->speed_rpm * chassis_power_control->motor_chassis[i].chassis_motor_measure->speed_rpm +
 								a * chassis_power_control->motor_speed_pid[i].out * chassis_power_control->motor_speed_pid[i].out + constant;
 
-		if (initial_give_power < 0) // negative power not included (transitory)
+		if (initial_give_power[i] < 0) // negative power not included (transitory)
 			continue;
 		initial_total_power += initial_give_power[i];
 	}
@@ -84,26 +91,24 @@ void chassis_power_control(chassis_move_t *chassis_power_control)
 			fp32 b = toque_coefficient * chassis_power_control->motor_chassis[i].chassis_motor_measure->speed_rpm;
 			fp32 c = k1 * chassis_power_control->motor_chassis[i].chassis_motor_measure->speed_rpm * chassis_power_control->motor_chassis[i].chassis_motor_measure->speed_rpm - scaled_give_power[i] + constant;
 
-			if (chassis_power_control->motor_speed_pid[i].out > 0) // Selection of the calculation formula according to the direction of the original moment
+			fp32 requested = chassis_power_control->motor_speed_pid[i].out;
+			fp32 discriminant = b * b - 4 * a * c;
+			if (!isfinite(discriminant) || discriminant < 0.0f || !isfinite(requested))
 			{
-				fp32 temp = (-b + sqrt(b * b - 4 * a * c)) / (2 * a);
-				if (temp > 16000)
-				{
-					chassis_power_control->motor_speed_pid[i].out = 16000;
-				}
-				else
-					chassis_power_control->motor_speed_pid[i].out = temp;
+				/* No real solution: avoid NaN commands. This is not a power guarantee. */
+				chassis_power_control->motor_speed_pid[i].out = 0.0f;
+				continue;
 			}
+			fp32 root = sqrtf(discriminant);
+			fp32 temp = (-b + (requested > 0.0f ? root : -root)) / (2 * a);
+			if (!isfinite(temp))
+				temp = 0.0f;
+			/* Limiting must not reverse or enlarge the requested current. */
+			if (requested > 0.0f)
+				temp = fmaxf(0.0f, fminf(temp, fminf(requested, 16000.0f)));
 			else
-			{
-				fp32 temp = (-b - sqrt(b * b - 4 * a * c)) / (2 * a);
-				if (temp < -16000)
-				{
-					chassis_power_control->motor_speed_pid[i].out = -16000;
-				}
-				else
-					chassis_power_control->motor_speed_pid[i].out = temp;
-			}
+				temp = fminf(0.0f, fmaxf(temp, fmaxf(requested, -16000.0f)));
+			chassis_power_control->motor_speed_pid[i].out = temp;
 		}
 	}
 }
